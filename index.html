@@ -1,0 +1,1006 @@
+import React, { useState, useEffect } from 'react';
+import { RefreshCw, Play, Undo } from 'lucide-react';
+
+// The exact 10 requested prizes in the exact tracker order
+const DEFAULT_PRIZES = [
+  "Penny",              // 0
+  "Pencil",             // 1
+  "$1 Snack Closet",    // 2
+  "Logo Day",           // 3
+  "1 Hour Late Start",  // 4
+  "Ice Cream Truck",    // 5
+  "Chickies Lunch",     // 6
+  "Movie Day",          // 7
+  "Bake Tour",          // 8 (Rigged to be the winner / secret anagram!)
+  "Free Snow Day"       // 9 
+];
+
+// Anagram Mapping: BAKE TOUR -> BREAKOUT
+// Start positions: 0:B, 1:A, 2:K, 3:E, (4 is space), 5:T, 6:O, 7:U, 8:R
+// End positions: 0:B, 1:R, 2:E, 3:A, 4:K, 5:O, 6:U, 7:T
+const ANAGRAM_DATA = [
+  { id: 'B', char: 'B', startI: 0, endI: 0 },
+  { id: 'A', char: 'A', startI: 1, endI: 3 },
+  { id: 'K', char: 'K', startI: 2, endI: 4 },
+  { id: 'E', char: 'E', startI: 3, endI: 2 },
+  { id: 'T', char: 'T', startI: 5, endI: 7 }, 
+  { id: 'O', char: 'O', startI: 6, endI: 5 },
+  { id: 'U', char: 'U', startI: 7, endI: 6 },
+  { id: 'R', char: 'R', startI: 8, endI: 1 },
+];
+
+export default function App() {
+  // --- INITIALIZATION ---
+  const INITIAL_PRIZES = [0, 1, 2, 3, 4, 5, 6, 9, 8, 7]; // Snow Day at 7 (bottom middle)
+  
+  const getInitialCases = () => INITIAL_PRIZES.map((prizeId, index) => ({
+    uid: index, 
+    slot: index, 
+    id: null, 
+    prizeId: prizeId, 
+    opened: false
+  }));
+
+  const getInitialPrizes = () => DEFAULT_PRIZES.map((text, index) => ({
+    id: index,
+    text: text,
+    eliminated: false
+  }));
+
+  // --- STATE ---
+  const [gameState, setGameState] = useState('hover_tease'); // Boots straight into game
+  const [prizes, setPrizes] = useState(getInitialPrizes()); 
+  const [cases, setCases] = useState(getInitialCases()); 
+  const [playerCase, setPlayerCase] = useState(null);
+  const [hoveredUid, setHoveredUid] = useState(null); 
+  const [revealingCase, setRevealingCase] = useState(null);
+  const [wonPrize, setWonPrize] = useState(null);
+  const [revealStep, setRevealStep] = useState('focus'); // focus -> animating -> board
+  const [eliminatedHistory, setEliminatedHistory] = useState([]);
+  
+  const [pendingSwapAction, setPendingSwapAction] = useState(null); // 'keep', 'swap', or null
+
+  // History for the Undo Button
+  const [history, setHistory] = useState([]);
+
+  // start -> animating -> done
+  const [anagramPhase, setAnagramPhase] = useState('start'); 
+
+  const showSideBoards = ['playing', 'revealing', 'pre_swap_board', 'swap_offer', 'reveal_loser', 'pre_final_board', 'game_over'].includes(gameState);
+
+  const remainingCase = cases.find(c => !c.opened && c.id !== playerCase);
+
+  // --- HISTORY & UNDO LOGIC ---
+  const saveStateToHistory = () => {
+    // We strictly deep-clone the objects so mutations don't corrupt the history!
+    setHistory(prev => [...prev, {
+      gameState, 
+      prizes: prizes.map(p => ({ ...p })), 
+      cases: cases.map(c => ({ ...c })), 
+      playerCase, 
+      revealingCase: revealingCase ? { ...revealingCase } : null, 
+      revealStep, 
+      wonPrize, 
+      anagramPhase, 
+      pendingSwapAction,
+      eliminatedHistory: eliminatedHistory.map(h => ({ ...h }))
+    }]);
+  };
+
+  const undo = () => {
+    setHistory(prev => {
+      if (prev.length === 0) return prev;
+      const newHistory = [...prev];
+      const lastState = newHistory.pop();
+      
+      setGameState(lastState.gameState);
+      setCases(lastState.cases.map(c => ({ ...c })));
+      setPrizes(lastState.prizes.map(p => ({ ...p })));
+      setEliminatedHistory(lastState.eliminatedHistory.map(h => ({ ...h })));
+      setPlayerCase(lastState.playerCase);
+      setRevealingCase(lastState.revealingCase ? { ...lastState.revealingCase } : null);
+      setRevealStep(lastState.revealStep);
+      setWonPrize(lastState.wonPrize);
+      setAnagramPhase(lastState.anagramPhase);
+      setPendingSwapAction(lastState.pendingSwapAction || null);
+      
+      return newHistory;
+    });
+  };
+
+  const resetGame = () => {
+    setGameState('hover_tease');
+    setPrizes(getInitialPrizes());
+    setCases(getInitialCases());
+    setPlayerCase(null);
+    setHoveredUid(null);
+    setRevealingCase(null);
+    setWonPrize(null);
+    setRevealStep('focus');
+    setEliminatedHistory([]);
+    setPendingSwapAction(null);
+    setHistory([]);
+    setAnagramPhase('start');
+  };
+
+  // --- DRAMATIC REVEAL TIMER ---
+  useEffect(() => {
+    let timer;
+    if (revealStep === 'animating') {
+      if (gameState === 'final_revealing') {
+        timer = setTimeout(() => handleFinalOpen(), 2500);
+      } else {
+        timer = setTimeout(() => setRevealStep('board'), 2500);
+      }
+    }
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revealStep, gameState]);
+
+  // --- THE INVISIBLE TRIGGER ---
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.code === 'Space' || e.code === 'Enter' || e.code === 'ArrowRight' || e.code === 'PageDown') {
+        if (gameState === 'game_over' && wonPrize === 'Bake Tour') {
+          e.preventDefault(); 
+          setGameState('anagram');
+          setAnagramPhase('start');
+        } else if (gameState === 'anagram' && anagramPhase === 'start') {
+          e.preventDefault();
+          setAnagramPhase('animating');
+          setTimeout(() => setAnagramPhase('done'), 2000);
+        }
+      }
+    };
+    
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [gameState, wonPrize, anagramPhase]);
+
+  // --- AUTOMATIC ANAGRAM TRIGGER ---
+  useEffect(() => {
+    if (gameState === 'anagram' && anagramPhase === 'start') {
+      const t1 = setTimeout(() => setAnagramPhase('animating'), 50);
+      const t2 = setTimeout(() => setAnagramPhase('done'), 2050);
+      return () => { clearTimeout(t1); clearTimeout(t2); };
+    }
+  }, [gameState, anagramPhase]);
+
+  // --- TRUE VISUAL SHUFFLE ANIMATION ---
+  useEffect(() => {
+    let t3, interval;
+    
+    if (gameState === 'tease_shuffle') {
+      let count = 0;
+      interval = setInterval(() => {
+        count++;
+        
+        setCases((prev) => {
+          const newCases = [...prev];
+          const slots = newCases.map(c => c.slot);
+          for (let i = slots.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [slots[i], slots[j]] = [slots[j], slots[i]];
+          }
+          return newCases.map((c, idx) => ({ ...c, slot: slots[idx] }));
+        });
+        
+        if (count >= 6) { 
+          clearInterval(interval);
+          t3 = setTimeout(() => setGameState('assign_numbers'), 900);
+        }
+      }, 900); 
+    } 
+    else if (gameState === 'assign_numbers') {
+      setCases((prev) => {
+        let numberedCases = prev.map((c) => ({ ...c, id: c.slot + 1 }));
+        return numberedCases.sort((a, b) => a.id - b.id);
+      });
+      setGameState('pick_own');
+    }
+
+    return () => {
+      clearTimeout(t3);
+      clearInterval(interval);
+    };
+  }, [gameState]);
+
+  const handleCaseClick = (caseId) => {
+    saveStateToHistory();
+
+    if (gameState === 'pick_own') {
+      setPlayerCase(caseId);
+      setGameState('playing');
+    } else if (gameState === 'playing') {
+      let currentCases = [...cases];
+      const clickedCaseIndex = currentCases.findIndex(c => c.id === caseId);
+      let clickedCase = currentCases[clickedCaseIndex];
+
+      if (clickedCase.opened || caseId === playerCase) {
+        setHistory(prev => prev.slice(0, -1));
+        return;
+      }
+
+      // --- DYNAMIC RIGGING ENGINE ---
+      const TURN_ORDER = [4, 3, 0, 7, 6, 2, 9, 5]; 
+      const turnIndex = currentCases.filter(c => c.opened).length; 
+      
+      if (turnIndex < 8) {
+        const targetPrizeId = TURN_ORDER[turnIndex];
+        const caseWithTargetIndex = currentCases.findIndex(c => c.prizeId === targetPrizeId);
+        
+        if (caseWithTargetIndex !== -1 && currentCases[caseWithTargetIndex].id !== clickedCase.id) {
+          const tempPrizeId = clickedCase.prizeId;
+          currentCases[clickedCaseIndex] = { ...currentCases[clickedCaseIndex], prizeId: targetPrizeId };
+          currentCases[caseWithTargetIndex] = { ...currentCases[caseWithTargetIndex], prizeId: tempPrizeId };
+          
+          clickedCase = currentCases[clickedCaseIndex];
+          setCases(currentCases);
+        }
+      }
+
+      setRevealingCase(clickedCase);
+      setRevealStep('focus');
+      setGameState('revealing');
+    }
+  };
+
+  const executeReveal = () => {
+    saveStateToHistory();
+    const caseId = revealingCase.id;
+    const updatedCases = cases.map(c => c.id === caseId ? { ...c, opened: true } : c);
+    setCases(updatedCases);
+
+    const updatedPrizes = prizes.map(p => p.id === revealingCase.prizeId ? { ...p, eliminated: true } : p);
+    setPrizes(updatedPrizes);
+
+    const revealedPrize = prizes.find(p => p.id === revealingCase.prizeId);
+    setEliminatedHistory(prev => [...prev, revealedPrize]);
+
+    setRevealingCase(null);
+
+    const unopenedCount = updatedCases.filter(c => !c.opened).length;
+    
+    if (unopenedCount === 2) {
+      setGameState('pre_swap_board');
+    } else {
+      setGameState('playing');
+    }
+  };
+
+  const handleKeepCase = () => {
+    saveStateToHistory();
+    const pCase = cases.find(c => c.id === playerCase);
+    const oCase = cases.find(c => !c.opened && c.id !== playerCase);
+    
+    const updatedCases = cases.map(c => {
+      if (c.id === pCase.id) return { ...c, prizeId: 8 };
+      if (c.id === oCase.id) return { ...c, prizeId: 1 };
+      return c;
+    });
+    setCases(updatedCases);
+    
+    setRevealingCase(updatedCases.find(c => c.id === oCase.id)); 
+    setRevealStep('focus');
+    setGameState('reveal_loser');
+  };
+
+  const handleSwapCase = () => {
+    saveStateToHistory();
+    const pCase = cases.find(c => c.id === playerCase);
+    const oCase = cases.find(c => !c.opened && c.id !== playerCase);
+    
+    const updatedCases = cases.map(c => {
+      if (c.id === oCase.id) return { ...c, prizeId: 8 };
+      if (c.id === pCase.id) return { ...c, prizeId: 1 };
+      return c;
+    });
+    setCases(updatedCases);
+    
+    setPlayerCase(oCase.id); 
+    setRevealingCase(updatedCases.find(c => c.id === pCase.id)); 
+    setRevealStep('focus');
+    setGameState('reveal_loser');
+  };
+
+  const executeLoserReveal = () => {
+    saveStateToHistory();
+    const caseId = revealingCase.id;
+    const updatedCases = cases.map(c => c.id === caseId ? { ...c, opened: true } : c);
+    setCases(updatedCases);
+
+    const updatedPrizes = prizes.map(p => p.id === revealingCase.prizeId ? { ...p, eliminated: true } : p);
+    setPrizes(updatedPrizes);
+
+    const revealedPrize = prizes.find(p => p.id === revealingCase.prizeId);
+    setEliminatedHistory(prev => [...prev, revealedPrize]);
+
+    setRevealingCase(updatedCases.find(c => c.id === playerCase));
+    setGameState('pre_final_board');
+  };
+
+  const handleFinalOpen = () => {
+    saveStateToHistory();
+    const myCase = cases.find(c => c.id === playerCase);
+    const wonPrizeObj = prizes.find(p => p.id === myCase.prizeId);
+    
+    setWonPrize(wonPrizeObj.text);
+    setCases(cases.map(c => ({ ...c, opened: true }))); 
+    setPrizes(prizes.map(p => ({ ...p, eliminated: true }))); 
+    setGameState('game_over'); 
+  };
+
+  const renderPrizeBoard = (side) => {
+    const startIdx = side === 'left' ? 0 : 5;
+    const endIdx = side === 'left' ? 5 : 10;
+    const boardPrizes = prizes.slice(startIdx, endIdx);
+
+    return (
+      <div className="flex flex-col justify-between w-full h-full px-1 py-1 min-h-0">
+        {side === 'left' && <div className="text-center text-gray-400 font-black font-sans text-xs sm:text-sm md:text-base tracking-widest uppercase mb-1 sm:mb-2 drop-shadow-md">Worst</div>}
+        {side === 'right' && <div className="text-center text-transparent text-xs sm:text-sm md:text-base tracking-widest uppercase mb-1 sm:mb-2 drop-shadow-md select-none">Placeholder</div>}
+        
+        <div className="flex flex-col justify-between w-full h-full gap-1 sm:gap-2 md:gap-3 flex-1 min-h-0">
+          {boardPrizes.map((prize) => {
+            const isBlank = !prize.eliminated;
+            return (
+              <div 
+                key={prize.id}
+                className={`
+                  flex-1 flex items-center justify-center px-1 sm:px-3 py-1 min-h-[30px] sm:min-h-[40px] border-[2px] md:border-[3px] rounded-md text-center font-black font-sans transition-all duration-300 relative overflow-hidden
+                  ${isBlank 
+                    ? 'bg-[#0f2a4a]/40 border-[#1e40af]/30 shadow-[inset_0_0_10px_rgba(0,0,0,0.5)] text-[#facc15]/20' 
+                    : 'bg-[#110000] text-red-500 border-red-800 shadow-[inset_0_0_20px_rgba(0,0,0,1)] opacity-100'}
+                `}
+              >
+                {isBlank ? (
+                  <span className="text-xl md:text-3xl font-black font-sans">?</span>
+                ) : (
+                  <div className="w-full uppercase tracking-wider relative z-10 px-1 text-[10px] sm:text-[11px] md:text-[13px] lg:text-sm xl:text-base break-words whitespace-normal leading-tight flex items-center justify-center font-sans font-black">
+                    {prize.text}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {side === 'right' && <div className="text-center text-yellow-400 font-black font-sans text-xs sm:text-sm md:text-base tracking-widest uppercase mt-1 sm:mt-2 drop-shadow-md">Best</div>}
+        {side === 'left' && <div className="text-center text-transparent text-xs sm:text-sm md:text-base tracking-widest uppercase mt-1 sm:mt-2 drop-shadow-md select-none">Placeholder</div>}
+      </div>
+    );
+  };
+
+  const renderCase = (c, isBig = false, isGiant = false) => {
+    const isPlayerCase = c.id === playerCase;
+    const isHidden = !isBig && !isGiant && (c.opened || (isPlayerCase && gameState !== 'hover_tease' && gameState !== 'tease_shuffle' && gameState !== 'assign_numbers'));
+
+    const isGridCase = !isBig && !isGiant;
+    
+    // Completely unblocked 'Bake Tour' so you can peek at it during hover
+    const isPeeking = gameState === 'hover_tease' && hoveredUid === c.uid && isGridCase;
+    const myPrize = prizes.find(p => p.id === c.prizeId);
+
+    // Giant cases are fully clickable to resolve the un-clickable modal issue
+    const isClickable = (() => {
+      if (isHidden) return false;
+      if (isGiant) return true; 
+      if (gameState === 'swap_offer') return isPlayerCase || c.id === remainingCase?.id;
+      if (isGridCase) return ['pick_own', 'playing', 'hover_tease'].includes(gameState);
+      return false;
+    })();
+
+    const dims = isGiant 
+      ? "w-[260px] sm:w-[320px] md:w-[400px]" 
+      : isBig 
+        ? "w-[120px] sm:w-[150px] md:w-[180px]" 
+        : "w-[90%] sm:w-[85%] md:w-[80%] max-w-[240px]"; 
+
+    const caseContent = (
+      <button
+        onClick={() => {
+          if (!isClickable) return;
+          if (gameState === 'pre_final_board') {
+            saveStateToHistory();
+            setGameState('final_revealing');
+            setRevealStep('animating');
+          } else if (gameState === 'revealing' || gameState === 'reveal_loser') {
+            if (revealStep === 'focus') {
+              saveStateToHistory();
+              setRevealStep('animating');
+            }
+          } else if (gameState === 'swap_offer') {
+            setPendingSwapAction(isPlayerCase ? 'keep' : 'swap');
+          } else if (isGridCase && c.id) {
+            handleCaseClick(c.id);
+          }
+        }}
+        onMouseEnter={() => gameState === 'hover_tease' && setHoveredUid(c.uid)}
+        onMouseLeave={() => gameState === 'hover_tease' && setHoveredUid(null)}
+        disabled={!isClickable}
+        className={`
+          relative flex flex-col items-center justify-end aspect-[4/3] ${dims}
+          transition-transform duration-200 ease-out
+          ${(isClickable && (isGiant || c.id || gameState === 'hover_tease')) ? 'hover:scale-105 hover:-translate-y-1 cursor-pointer' : ''}
+          drop-shadow-[0_15px_20px_rgba(0,0,0,0.9)]
+        `}
+      >
+        {/* THE METALLIC HANDLE */}
+        <div className="absolute -top-[15%] w-[35%] h-[25%] bg-transparent border-t-[4px] border-x-[4px] md:border-t-[8px] md:border-x-[8px] border-[#a1a1aa] rounded-t-lg z-0 shadow-[inset_0_2px_4px_rgba(255,255,255,0.9),0_4px_8px_rgba(0,0,0,0.9)]">
+           <div className="absolute inset-0 bg-gradient-to-b from-white/60 to-transparent"></div>
+        </div>
+        
+        {/* THE MAIN CASE BODY */}
+        <div className="relative w-full h-full rounded-md md:rounded-lg border-[3px] md:border-[4px] border-[#ffffff] overflow-hidden shadow-[inset_0_-10px_20px_rgba(0,0,0,0.8),inset_0_2px_15px_rgba(255,255,255,1)] z-10 flex items-center justify-center"
+             style={{ background: 'repeating-linear-gradient(to bottom, #f4f4f5, #f4f4f5 2px, #d4d4d8 4px, #d4d4d8 6px)' }}>
+          
+          <div className="absolute top-0 bottom-0 left-0 w-2 md:w-5 bg-gradient-to-r from-white/90 to-transparent pointer-events-none"></div>
+          <div className="absolute top-0 bottom-0 right-0 w-2 md:w-5 bg-gradient-to-l from-black/60 to-transparent pointer-events-none"></div>
+          <div className="absolute bottom-0 left-0 right-0 h-2 md:h-5 bg-gradient-to-t from-black/70 to-transparent pointer-events-none"></div>
+
+          <div className="absolute top-0 left-0 w-2 h-2 md:w-4 md:h-4 bg-[#666] rounded-br-sm shadow-inner z-20"></div>
+          <div className="absolute top-0 right-0 w-2 h-2 md:w-4 md:h-4 bg-[#444] rounded-bl-sm shadow-inner z-20"></div>
+          <div className="absolute bottom-0 left-0 w-2 h-2 md:w-4 md:h-4 bg-[#333] rounded-tr-sm shadow-inner z-20"></div>
+          <div className="absolute bottom-0 right-0 w-2 h-2 md:w-4 md:h-4 bg-[#111] rounded-tl-sm shadow-inner z-20"></div>
+
+          {/* CASE INTERIOR (Visible during Tease) */}
+          {isPeeking ? (
+            <div className="absolute inset-[6%] bg-gradient-to-br from-white to-gray-200 border-[2px] md:border-[4px] border-yellow-400 rounded-md flex items-center justify-center p-2 z-30 shadow-[inset_0_0_20px_rgba(0,0,0,0.2),0_0_30px_rgba(255,255,255,1)] overflow-hidden">
+              <span className="w-full text-[#0f2a4a] font-sans font-black text-center uppercase leading-tight tracking-normal break-words whitespace-normal text-xs sm:text-sm md:text-lg lg:text-xl xl:text-2xl px-1">
+                {myPrize?.text}
+              </span>
+            </div>
+          ) : (
+            /* THE NUMBER PLATE (Blank during Tease Closed) */
+            <div className={`
+              relative bg-gradient-to-br from-[#0f2a4a] to-[#051124] text-[#facc15] font-sans font-black flex items-center justify-center rounded-lg border-[2px] md:border-[4px] border-[#1e40af] shadow-[0_5px_15px_rgba(0,0,0,1),inset_0_0_15px_rgba(0,0,0,0.8)] z-20
+              ${isGiant ? 'w-[50%] h-[40%] text-[4rem] md:text-[6rem]' : isBig ? 'w-[50%] h-[40%] text-3xl sm:text-5xl md:text-6xl' : 'w-[50%] h-[40%] text-2xl sm:text-4xl md:text-5xl'}
+            `}>
+              <span className={`tracking-normal relative z-10 leading-none transition-opacity duration-300 ${!c.id ? 'opacity-0' : 'opacity-100'}`} style={{ textShadow: '0 2px 4px rgba(0,0,0,0.8)' }}>
+                {c.id || 'X'}
+              </span>
+              <div className="absolute top-0 left-0 right-0 h-1/2 bg-gradient-to-b from-white/20 to-transparent pointer-events-none rounded-t-md"></div>
+            </div>
+          )}
+        </div>
+      </button>
+    );
+
+    // FLawless mathematical absolute positioning for the main grid! 
+    if (isGridCase) {
+      const logicalIndex = c.id ? c.id - 1 : c.slot;
+      const col = logicalIndex % 5;
+      const row = Math.floor(logicalIndex / 5);
+      
+      return (
+        <div 
+          key={`case-${c.uid}`} 
+          className={`absolute transition-all duration-700 ease-in-out flex items-center justify-center p-1 sm:p-2 ${isHidden ? 'opacity-0 scale-50 pointer-events-none' : 'opacity-100 scale-100'}`}
+          style={{ 
+            left: `${col * 20}%`, 
+            top: `${row * 50}%`, 
+            width: '20%', 
+            height: '50%' 
+          }}
+        >
+          {caseContent}
+        </div>
+      );
+    }
+
+    return (
+      <div key={`case-${c.uid}`} className={`flex items-center justify-center w-full transition-[opacity,transform] duration-500 ease-in-out ${isHidden ? 'opacity-0 scale-50 pointer-events-none' : 'opacity-100 scale-100'}`}>
+        {caseContent}
+      </div>
+    );
+  };
+
+  const renderCasesGrid = () => {
+    if (gameState === 'pre_final_board') {
+      const finalCase = cases.find(c => c.id === playerCase);
+      return (
+        <div className="w-full flex-1 flex flex-col items-center justify-center p-2 min-h-0 animate-[popIn_0.4s_ease-out_both]">
+          <div className="text-yellow-400 font-black font-sans text-2xl sm:text-4xl md:text-5xl tracking-widest mb-6 sm:mb-10 drop-shadow-md">
+            YOUR FINAL CASE
+          </div>
+          {renderCase(finalCase, false, true)}
+          <div className="mt-8 text-white font-black font-sans text-lg sm:text-2xl md:text-3xl uppercase tracking-widest text-center animate-pulse">
+            CLICK TO REVEAL YOUR PRIZE
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className="w-full flex-1 flex items-center justify-center p-2 min-h-0">
+        <div className="relative w-full h-full max-w-[1400px] min-h-[300px] max-h-[80vh]">
+           {cases.map((c) => renderCase(c, false, false))}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="h-screen w-full flex flex-col overflow-hidden bg-[#051124] font-sans selection:bg-yellow-500 selection:text-[#0f2a4a] relative">
+      
+      {/* Authentic Studio LED Background */}
+      <div className="absolute inset-0 z-0" style={{
+        backgroundColor: '#051124',
+        backgroundImage: 'radial-gradient(#1e40af 20%, transparent 21%), radial-gradient(#1e40af 20%, transparent 21%)',
+        backgroundSize: '30px 30px',
+        backgroundPosition: '0 0, 15px 15px',
+        opacity: 0.6
+      }}>
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_rgba(0,0,0,0)_0%,_rgba(0,0,0,0.95)_100%)]"></div>
+      </div>
+
+      <div className="relative z-10 flex-1 flex flex-col w-full h-full p-2 md:p-6 min-h-0">
+        
+        {/* HEADER WITH LOGO AND UNDO */}
+        <header className="flex-shrink-0 flex justify-center items-center pb-2 md:pb-4 z-10 w-full relative">
+          
+          {/* UNDO BUTTON */}
+          {history.length > 0 && (
+            <button 
+              onClick={undo}
+              className="absolute left-2 md:left-8 text-yellow-500/50 hover:text-yellow-500 transition-colors p-2 flex flex-col items-center"
+              title="Undo Last Move"
+            >
+              <Undo className="w-6 h-6 md:w-8 md:h-8" />
+              <span className="text-[10px] font-black tracking-wider mt-1 hidden sm:block">UNDO</span>
+            </button>
+          )}
+
+          <img 
+            src="Moriah Lions SHIELD ONLY Logo 123-293-K.png" 
+            alt="Moriah Lions" 
+            className="h-10 sm:h-12 md:h-16 lg:h-20 mr-2 md:mr-6 drop-shadow-[0_0_15px_rgba(250,204,21,0.5)] object-contain" 
+            onError={(e) => e.target.style.display = 'none'} 
+          />
+
+          <div className="bg-gradient-to-b from-yellow-300 to-yellow-600 border-2 md:border-4 border-[#0f2a4a] px-4 md:px-8 py-1 md:py-2 shadow-[0_0_20px_rgba(250,204,21,0.4)] flex items-center">
+            <h1 className="text-xl sm:text-3xl md:text-5xl font-black font-sans text-[#0f2a4a] tracking-wider uppercase drop-shadow-md leading-none">
+              DEAL
+            </h1>
+            <div className="flex flex-col text-[6px] sm:text-[10px] md:text-[14px] font-black font-sans text-[#0f2a4a] leading-none mx-2 md:mx-4 tracking-wider">
+              <span>O</span>
+              <span>R</span>
+            </div>
+            <h1 className="text-xl sm:text-3xl md:text-5xl font-black font-sans text-[#0f2a4a] tracking-wider uppercase drop-shadow-md leading-none">
+              NO DEAL
+            </h1>
+          </div>
+          
+          <button 
+            onClick={resetGame}
+            className="absolute right-4 md:right-8 text-yellow-500/30 hover:text-yellow-500 transition-colors p-2 flex flex-col items-center"
+            title="Reset Game"
+          >
+            <RefreshCw className="w-5 h-5 md:w-8 md:h-8" />
+          </button>
+        </header>
+
+        {/* STATUS BAR */}
+        <div className="flex-shrink-0 text-center flex items-center justify-center z-10 mb-2 sm:mb-4 w-full">
+          {gameState === 'hover_tease' && (
+            <h2 className="text-xs sm:text-lg md:text-2xl font-black font-sans text-[#0f2a4a] bg-yellow-400 border-[2px] md:border-[3px] border-white px-4 md:px-8 py-1 md:py-2 uppercase tracking-widest shadow-[0_0_20px_rgba(250,204,21,1)]">
+              MEMORIZE THE PRIZES!
+            </h2>
+          )}
+          {gameState === 'tease_shuffle' && (
+            <h2 className="text-xs sm:text-lg md:text-2xl font-black font-sans text-white bg-red-600 border-[2px] md:border-[3px] border-white px-4 md:px-8 py-1 md:py-2 uppercase tracking-widest shadow-[0_0_20px_rgba(220,38,38,1)] animate-pulse">
+              SHUFFLING!
+            </h2>
+          )}
+          {gameState === 'assign_numbers' && (
+            <h2 className="text-xs sm:text-lg md:text-2xl font-black font-sans text-white bg-green-600 border-[2px] md:border-[3px] border-white px-4 md:px-8 py-1 md:py-2 uppercase tracking-widest shadow-[0_0_20px_rgba(22,163,74,1)]">
+              LOCKING IN...
+            </h2>
+          )}
+          {gameState === 'pick_own' && (
+            <h2 className="text-xs sm:text-lg md:text-2xl font-black font-sans text-[#0f2a4a] bg-yellow-400 border-[2px] md:border-[3px] border-white px-4 md:px-8 py-1 md:py-2 uppercase tracking-widest shadow-[0_0_20px_rgba(250,204,21,1)] animate-pulse">
+              CHOOSE YOUR CASE
+            </h2>
+          )}
+          {gameState === 'playing' && (
+            <h2 className="text-xs sm:text-lg md:text-2xl font-black font-sans text-white bg-[#0f2a4a] border-[2px] md:border-[3px] border-yellow-400 px-4 md:px-8 py-1 md:py-2 uppercase tracking-widest shadow-[0_0_20px_rgba(30,64,175,0.8)]">
+              ELIMINATE A CASE
+            </h2>
+          )}
+          {gameState === 'pre_swap_board' && (
+            <h2 className="text-xs sm:text-lg md:text-2xl font-black font-sans text-[#0f2a4a] bg-yellow-400 border-[2px] md:border-[3px] border-white px-4 md:px-8 py-1 md:py-2 uppercase tracking-widest shadow-[0_0_20px_rgba(250,204,21,1)]">
+              2 CASES REMAIN
+            </h2>
+          )}
+          {gameState === 'swap_offer' && (
+            <h2 className="text-xl sm:text-2xl md:text-4xl font-black font-sans text-white bg-red-600 border-[3px] border-white px-6 md:px-12 py-2 md:py-3 uppercase tracking-widest shadow-[0_0_30px_rgba(220,38,38,1)] animate-pulse">
+              SWAP OR STAY
+            </h2>
+          )}
+          {gameState === 'pre_final_board' && (
+            <h2 className="text-xs sm:text-lg md:text-2xl font-black font-sans text-[#0f2a4a] bg-yellow-400 border-[2px] md:border-[3px] border-white px-4 md:px-8 py-1 md:py-2 uppercase tracking-widest shadow-[0_0_20px_rgba(250,204,21,1)]">
+              YOUR FINAL CASE
+            </h2>
+          )}
+        </div>
+
+        {/* MAIN ARENA */}
+        <div className="flex-1 flex flex-col md:flex-row w-full max-w-[1920px] mx-auto z-10 min-h-0 gap-2 lg:gap-6 px-1 lg:px-4 relative">
+          
+          {/* Left Graveyard Board */}
+          {showSideBoards && (
+            <div className="hidden md:flex flex-col justify-center items-center w-[20%] lg:w-[22%] h-full max-w-[300px] animate-[popIn_0.4s_ease-out_both]">
+              {renderPrizeBoard('left')}
+            </div>
+          )}
+
+          {/* Center Stage */}
+          <div className="flex-1 flex flex-col items-center justify-between h-full min-w-0 min-h-0 transition-all duration-500 relative">
+            
+            {/* Top Absolute Button for Pre-Swap phase */}
+            <div className="absolute top-2 left-0 right-0 flex justify-center z-30 pointer-events-none">
+              {gameState === 'pre_swap_board' && (
+                <button 
+                  onClick={() => setGameState('swap_offer')} 
+                  className="pointer-events-auto bg-yellow-400 hover:bg-yellow-300 text-[#0f2a4a] border-[3px] md:border-[4px] border-white px-6 md:px-8 py-2 md:py-3 font-black font-sans uppercase text-lg sm:text-xl md:text-3xl tracking-widest shadow-[0_0_15px_rgba(250,204,21,0.6)] transition-transform hover:scale-105 rounded-xl max-w-full text-center leading-tight"
+                >
+                  START FINAL ROUND
+                </button>
+              )}
+            </div>
+
+            {renderCasesGrid()}
+
+            {/* Player Podium Area */}
+            {gameState !== 'pre_final_board' && (
+              <div className="flex-shrink-0 flex flex-col items-center justify-end w-full h-[18vh] min-h-[120px] max-h-[200px] pb-2 z-20 mt-auto relative">
+                
+                {/* YOUR CASE LABEL */}
+                {playerCase && (
+                  <div className="absolute top-0 left-0 right-0 text-center text-yellow-400 font-black font-sans text-xl sm:text-2xl md:text-3xl tracking-widest drop-shadow-[0_4px_4px_rgba(0,0,0,1)] z-30 pointer-events-none">
+                    YOUR CASE
+                  </div>
+                )}
+
+                <div className="h-[3px] sm:h-[5px] w-[40%] max-w-[200px] bg-gradient-to-r from-transparent via-yellow-400 to-transparent shadow-[0_0_15px_rgba(250,204,21,0.8)] absolute bottom-0"></div>
+                
+                <div className="flex items-center justify-center h-full min-h-0 pt-8 sm:pt-10 pb-4">
+                  {gameState === 'hover_tease' ? (
+                    <button 
+                      onClick={() => setGameState('tease_shuffle')} 
+                      className="bg-yellow-400 hover:bg-yellow-300 text-[#0f2a4a] border-[3px] md:border-[4px] border-white px-6 md:px-10 py-3 md:py-4 font-black font-sans uppercase text-xl md:text-3xl tracking-widest shadow-[0_0_30px_rgba(250,204,21,0.8)] transition-transform hover:scale-105 rounded-xl"
+                    >
+                      SHUFFLE BOARD
+                    </button>
+                  ) : playerCase ? (
+                    renderCase(cases.find(c => c.id === playerCase), true)
+                  ) : (
+                    <div className="flex items-center justify-center aspect-[4/3] h-full max-w-[180px] border-[4px] border-dashed border-yellow-500/50 bg-[#08162b]/80 text-yellow-500/50 text-sm sm:text-base md:text-lg font-black font-sans uppercase text-center leading-tight shadow-[0_0_20px_rgba(30,64,175,0.4)]">
+                      WAITING
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Right Graveyard Board */}
+          {showSideBoards && (
+            <div className="hidden md:flex flex-col justify-center items-center w-[20%] lg:w-[22%] h-full max-w-[300px] animate-[popIn_0.4s_ease-out_both]">
+              {renderPrizeBoard('right')}
+            </div>
+          )}
+          
+          {/* Mobile Graveyard Boards */}
+          {showSideBoards && (
+            <div className="flex md:hidden w-full h-[18vh] min-h-[100px] flex-row gap-2 mt-auto animate-[popIn_0.4s_ease-out_both]">
+              <div className="flex-1 flex flex-col justify-center h-full min-w-0">{renderPrizeBoard('left')}</div>
+              <div className="flex-1 flex flex-col justify-center h-full min-w-0">{renderPrizeBoard('right')}</div>
+            </div>
+          )}
+        </div>
+
+      </div>
+
+      {/* --- MODALS --- */}
+
+      {/* SWAP CONFIRMATION MODAL */}
+      {gameState === 'swap_offer' && pendingSwapAction && (
+        <div className="fixed inset-0 bg-[#051124]/95 flex items-center justify-center z-50 p-4 transition-opacity duration-300 overflow-hidden">
+          <div className="flex flex-col items-center w-full max-w-3xl text-center relative">
+            <h2 className="text-2xl sm:text-3xl md:text-4xl text-white mb-8 sm:mb-12 font-black font-sans uppercase tracking-widest drop-shadow-[0_0_20px_rgba(30,64,175,0.8)]">
+              {pendingSwapAction === 'keep' ? `KEEP YOUR CASE (${playerCase})?` : `SWAP FOR CASE ${remainingCase.id}?`}
+            </h2>
+            <div>
+              {renderCase(pendingSwapAction === 'keep' ? cases.find(c => c.id === playerCase) : remainingCase, false, true)}
+            </div>
+            <div className="flex flex-col sm:flex-row items-center justify-center gap-4 sm:gap-8 mt-10 sm:mt-16 w-full px-4">
+              <button 
+                onClick={() => setPendingSwapAction(null)} 
+                className="text-gray-400 hover:text-white font-black font-sans uppercase tracking-widest text-lg sm:text-xl transition-colors px-6 py-2 border-2 border-transparent hover:border-gray-500 rounded"
+              >
+                CANCEL
+              </button>
+              <button 
+                onClick={() => {
+                  const action = pendingSwapAction;
+                  setPendingSwapAction(null);
+                  if (action === 'keep') handleKeepCase();
+                  else handleSwapCase();
+                }} 
+                className="text-[#0f2a4a] bg-yellow-400 hover:bg-yellow-300 text-lg sm:text-xl md:text-2xl animate-pulse font-black font-sans uppercase tracking-widest px-8 py-3 rounded shadow-[0_0_20px_rgba(250,204,21,0.6)] transition-all"
+              >
+                CONFIRM
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* NORMAL REVEAL SEQUENCE */}
+      {gameState === 'revealing' && revealingCase && (
+        <div className="fixed inset-0 bg-[#051124]/95 flex items-center justify-center z-50 p-4 transition-opacity duration-300 overflow-hidden">
+          
+          {revealStep === 'focus' && (
+            <div className="flex flex-col items-center w-full max-w-3xl text-center relative">
+              <h2 className="text-2xl sm:text-3xl md:text-4xl text-white mb-8 sm:mb-12 font-black font-sans uppercase tracking-widest drop-shadow-[0_0_20px_rgba(30,64,175,0.8)]">
+                OPEN CASE {revealingCase.id}?
+              </h2>
+              <div>
+                {renderCase(revealingCase, false, true)}
+              </div>
+              <div className="flex flex-col sm:flex-row items-center justify-center gap-4 sm:gap-8 mt-10 sm:mt-16 w-full px-4">
+                <button onClick={undo} className="text-gray-400 hover:text-white font-black font-sans uppercase tracking-widest text-lg sm:text-xl transition-colors px-6 py-2 border-2 border-transparent hover:border-gray-500 rounded">
+                  CANCEL
+                </button>
+                <p className="text-yellow-400 text-lg sm:text-xl md:text-2xl animate-pulse font-black font-sans uppercase tracking-widest px-4 py-2 pointer-events-none">
+                  CLICK CASE TO OPEN
+                </p>
+              </div>
+            </div>
+          )}
+
+          {revealStep === 'animating' && (
+            <div className="flex flex-col items-center w-full max-w-3xl text-center relative">
+              <h2 className="text-2xl sm:text-3xl md:text-4xl text-yellow-400 mb-8 sm:mb-12 font-black font-sans uppercase tracking-widest animate-pulse">
+                OPENING CASE {revealingCase.id}...
+              </h2>
+              <div className="animate-[intenseShake_2.5s_ease-in-out_forwards] pointer-events-none">
+                {renderCase(revealingCase, false, true)}
+              </div>
+            </div>
+          )}
+
+          {revealStep === 'board' && (
+            <div className="flex flex-col items-center w-full text-center">
+              <h2 className="text-lg sm:text-xl md:text-2xl font-black font-sans text-blue-300 mb-8 md:mb-12 uppercase tracking-widest">
+                CASE {revealingCase.id} CONTAINED
+              </h2>
+              
+              <div className="my-4 md:my-8 w-full flex justify-center px-4">
+                <div className="bg-gradient-to-b from-yellow-300 to-yellow-600 border-[4px] md:border-[10px] border-white px-4 md:px-12 py-8 md:py-20 w-full max-w-4xl shadow-[0_0_100px_rgba(250,204,21,0.6)] relative overflow-hidden rounded-xl animate-[slowReveal_1s_ease-out_forwards]">
+                  <div className="absolute top-0 left-0 right-0 h-[30%] bg-gradient-to-b from-white/60 to-transparent"></div>
+                  <div className="text-3xl sm:text-5xl md:text-6xl lg:text-7xl font-black font-sans text-[#0f2a4a] uppercase tracking-tight relative z-10 leading-none break-words">
+                     {prizes.find(p => p.id === revealingCase.prizeId)?.text}
+                  </div>
+                </div>
+              </div>
+              
+              <div className="mt-10 md:mt-16 animate-[popIn_0.5s_ease-out_1s_both]">
+                <button onClick={executeReveal} className="bg-[#0f2a4a] text-white border-[3px] md:border-4 border-yellow-400 hover:bg-blue-800 px-10 md:px-16 py-3 md:py-4 text-base sm:text-lg md:text-2xl font-black font-sans uppercase tracking-widest transition-colors shadow-[0_0_20px_rgba(30,64,175,0.6)]">
+                  CONTINUE
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* LOSER REVEAL SEQUENCE */}
+      {gameState === 'reveal_loser' && revealingCase && (
+        <div className="fixed inset-0 bg-[#051124]/95 flex items-center justify-center z-50 p-4 transition-opacity duration-300 overflow-hidden">
+          
+          {revealStep === 'focus' && (
+            <div className="flex flex-col items-center w-full max-w-3xl text-center">
+              <h2 className="text-lg sm:text-2xl md:text-3xl lg:text-4xl text-yellow-400 mb-8 sm:mb-12 font-black font-sans uppercase tracking-widest drop-shadow-[0_0_20px_rgba(250,204,21,0.8)] whitespace-nowrap">
+                LET'S SEE WHAT YOU GAVE UP...
+              </h2>
+              <div>
+                {renderCase(revealingCase, false, true)}
+              </div>
+              <p className="text-white mt-10 sm:mt-16 text-lg sm:text-xl md:text-2xl animate-pulse font-black font-sans uppercase tracking-widest">
+                CLICK TO OPEN CASE {revealingCase.id}
+              </p>
+            </div>
+          )}
+
+          {revealStep === 'animating' && (
+            <div className="flex flex-col items-center w-full max-w-3xl text-center relative">
+              <h2 className="text-lg sm:text-2xl md:text-3xl lg:text-4xl text-yellow-400 mb-8 sm:mb-12 font-black font-sans uppercase tracking-widest whitespace-nowrap animate-pulse">
+                OPENING CASE {revealingCase.id}...
+              </h2>
+              <div className="animate-[intenseShake_2.5s_ease-in-out_forwards] pointer-events-none">
+                {renderCase(revealingCase, false, true)}
+              </div>
+            </div>
+          )}
+
+          {revealStep === 'board' && (
+            <div className="flex flex-col items-center w-full text-center">
+              <h2 className="text-4xl sm:text-6xl md:text-7xl font-black font-sans text-blue-300 mb-8 md:mb-12 uppercase tracking-widest">
+                YOU PASSED ON...
+              </h2>
+              
+              <div className="my-4 md:my-8 w-full flex justify-center px-4">
+                <div className="bg-gradient-to-b from-gray-300 to-gray-500 border-[4px] md:border-[10px] border-white px-4 md:px-12 py-8 md:py-20 w-full max-w-4xl shadow-[0_0_100px_rgba(255,255,255,0.4)] relative overflow-hidden rounded-xl animate-[slowReveal_1s_ease-out_forwards]">
+                  <div className="absolute top-0 left-0 right-0 h-[30%] bg-gradient-to-b from-white/60 to-transparent"></div>
+                  <div className="text-3xl sm:text-5xl md:text-6xl lg:text-7xl font-black font-sans text-[#0f2a4a] uppercase tracking-tight relative z-10 leading-none break-words">
+                     {prizes.find(p => p.id === revealingCase.prizeId)?.text}
+                  </div>
+                </div>
+              </div>
+              
+              <div className="mt-10 md:mt-16 animate-[popIn_0.5s_ease-out_1s_both]">
+                <button onClick={executeLoserReveal} className="bg-yellow-400 text-[#0f2a4a] border-[3px] md:border-4 border-white hover:bg-yellow-300 px-10 md:px-16 py-3 md:py-4 text-base sm:text-lg md:text-2xl font-black font-sans uppercase tracking-widest transition-colors shadow-[0_0_20px_rgba(250,204,21,0.6)]">
+                  CONTINUE
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* FINAL WINNER ZOOM MODAL */}
+      {gameState === 'final_revealing' && revealingCase && (
+        <div className="fixed inset-0 bg-[#051124]/95 flex items-center justify-center z-50 p-4 overflow-hidden">
+          
+          {revealStep === 'focus' && (
+            <div className="flex flex-col items-center w-full max-w-3xl text-center">
+              <h2 className="text-2xl sm:text-4xl md:text-5xl font-black font-sans text-yellow-400 mb-10 sm:mb-16 uppercase tracking-widest text-center">
+                THE MOMENT OF TRUTH
+              </h2>
+              <div>
+                {renderCase(revealingCase, false, true)}
+              </div>
+              <p className="text-white mt-10 sm:mt-16 text-lg sm:text-xl md:text-2xl animate-pulse font-black font-sans uppercase tracking-widest">
+                CLICK TO OPEN YOUR CASE!
+              </p>
+            </div>
+          )}
+
+          {revealStep === 'animating' && (
+            <div className="flex flex-col items-center w-full max-w-3xl text-center">
+              <h2 className="text-2xl sm:text-4xl md:text-5xl font-black font-sans text-yellow-400 mb-10 sm:mb-16 uppercase tracking-widest text-center animate-pulse">
+                THE MOMENT OF TRUTH
+              </h2>
+              <div className="animate-[intenseShake_2.5s_ease-in-out_forwards] pointer-events-none">
+                {renderCase(revealingCase, false, true)}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* GAME OVER (PRE-ANAGRAM) */}
+      {gameState === 'game_over' && (
+        <div 
+          className="fixed inset-0 bg-[#051124]/95 flex items-center justify-center z-50 p-4 overflow-hidden cursor-pointer"
+          onClick={() => {
+            if (wonPrize === 'Bake Tour') {
+              setGameState('anagram');
+              setAnagramPhase('start');
+            }
+          }}
+        >
+          <div className="flex flex-col items-center w-full text-center animate-[popIn_0.3s_ease-out_both] pointer-events-none">
+            
+            <img 
+              src="Moriah Lions Logo WORDS ONLY 123-293-K.png" 
+              alt="Moriah Lions" 
+              className="h-16 sm:h-24 md:h-32 mb-6 drop-shadow-[0_0_15px_rgba(250,204,21,0.3)] object-contain" 
+              onError={(e) => e.target.style.display = 'none'} 
+            />
+
+            <div className="text-2xl sm:text-4xl md:text-5xl font-black font-sans text-yellow-400 mb-4 sm:mb-6 uppercase tracking-widest">
+              CONGRATULATIONS!
+            </div>
+            
+            <div className="text-xl sm:text-2xl md:text-3xl font-black font-sans text-blue-200 mb-6 uppercase tracking-widest">
+              YOU HAVE WON!
+            </div>
+            
+            <div className="w-full max-w-5xl px-4 md:px-12 py-12 md:py-24 bg-gradient-to-b from-yellow-300 to-yellow-600 border-[6px] md:border-[12px] border-white flex justify-center items-center shadow-[0_0_150px_rgba(250,204,21,0.6)] relative overflow-hidden rounded-2xl h-[200px] sm:h-[300px] md:h-[400px] animate-[slowReveal_1s_ease-out_forwards]">
+               <div className="absolute top-0 left-0 right-0 h-[30%] bg-gradient-to-b from-white/60 to-transparent"></div>
+               <h1 className="text-[3rem] sm:text-[5rem] md:text-[7rem] lg:text-[9rem] leading-none font-black font-sans text-[#0f2a4a] uppercase tracking-tight break-words relative z-10 whitespace-nowrap">
+                 {wonPrize}
+               </h1>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* FINAL ANAGRAM MODAL */}
+      {gameState === 'anagram' && (
+        <div 
+          className="fixed inset-0 bg-[#051124]/95 flex items-center justify-center z-50 p-4 overflow-hidden cursor-pointer"
+          onClick={() => {
+             if (anagramPhase === 'done') setGameState('breakout');
+          }}
+        >
+          <div className="flex flex-col items-center w-full text-center pointer-events-none">
+            
+            <img 
+              src="Moriah Lions Logo WORDS ONLY 123-293-K.png" 
+              alt="Moriah Lions" 
+              className={`h-16 sm:h-24 md:h-32 mb-6 drop-shadow-[0_0_15px_rgba(250,204,21,0.3)] object-contain transition-opacity duration-1000 ${anagramPhase !== 'start' ? 'opacity-0' : 'opacity-100'}`}
+              onError={(e) => e.target.style.display = 'none'} 
+            />
+
+            <div className={`text-2xl sm:text-4xl md:text-5xl font-black font-sans text-yellow-400 mb-4 sm:mb-6 uppercase tracking-widest transition-opacity duration-1000 ${anagramPhase !== 'start' ? 'opacity-0' : 'opacity-100'}`}>
+              CONGRATULATIONS!
+            </div>
+            
+            <div className={`text-xl sm:text-2xl md:text-3xl font-black font-sans text-blue-200 mb-6 uppercase tracking-widest transition-opacity duration-1000 ${anagramPhase !== 'start' ? 'opacity-0' : 'opacity-100'}`}>
+              YOU HAVE WON!
+            </div>
+            
+            <div className="w-full max-w-5xl px-4 md:px-12 py-12 md:py-24 bg-gradient-to-b from-yellow-300 to-yellow-600 border-[6px] md:border-[12px] border-white flex justify-center items-center shadow-[0_0_150px_rgba(250,204,21,0.8)] relative overflow-hidden rounded-2xl h-[200px] sm:h-[300px] md:h-[400px] flex-col">
+               <div className="absolute top-0 left-0 right-0 h-[30%] bg-gradient-to-b from-white/60 to-transparent"></div>
+               
+               <div className={`relative w-full h-[4rem] sm:h-[6rem] md:h-[8rem] lg:h-[10rem] flex items-center z-10 mx-auto px-2 sm:px-4`}>
+                  {ANAGRAM_DATA.map(letter => {
+                    const isStart = anagramPhase === 'start';
+                    const leftPos = isStart ? `${(letter.startI / 9) * 100}%` : `${(letter.endI / 8) * 100}%`;
+                    const width = isStart ? `${100 / 9}%` : `${100 / 8}%`;
+                    const rotate = isStart ? 'rotate(0deg)' : 'rotate(360deg)';
+                    
+                    return (
+                      <div
+                        key={letter.id}
+                        className="absolute top-0 bottom-0 flex justify-center items-center font-black font-sans text-[#0f2a4a] uppercase"
+                        style={{
+                          left: leftPos,
+                          width: width,
+                          transform: rotate,
+                          transition: 'all 2000ms cubic-bezier(0.68, -0.55, 0.265, 1.55)'
+                        }}
+                      >
+                        <span className="text-[3rem] sm:text-[5rem] md:text-[7rem] lg:text-[9rem] tracking-tight leading-none drop-shadow-sm whitespace-nowrap">
+                          {letter.char}
+                        </span>
+                      </div>
+                    )
+                  })}
+               </div>
+
+            </div>
+          </div>
+        </div>
+      )}
+
+      <style dangerouslySetInnerHTML={{__html: `
+        @keyframes popIn {
+          0% { transform: scale(0.8); opacity: 0; }
+          100% { transform: scale(1); opacity: 1; }
+        }
+        @keyframes intenseShake {
+          0% { transform: rotate(0deg) scale(1); filter: brightness(1); opacity: 1; }
+          10% { transform: rotate(-2deg) scale(1.02); filter: brightness(1.1); opacity: 1; }
+          20% { transform: rotate(2deg) scale(1.04); filter: brightness(1.2); opacity: 1; }
+          30% { transform: rotate(-2deg) scale(1.06); filter: brightness(1.3); opacity: 1; }
+          40% { transform: rotate(2deg) scale(1.08); filter: brightness(1.4); opacity: 1; }
+          50% { transform: rotate(-3deg) scale(1.1); filter: brightness(1.5); opacity: 1; }
+          60% { transform: rotate(3deg) scale(1.12); filter: brightness(1.6); opacity: 1; }
+          70% { transform: rotate(-3deg) scale(1.14); filter: brightness(1.8); opacity: 1; }
+          80% { transform: rotate(4deg) scale(1.16); filter: brightness(2); opacity: 1; }
+          90% { transform: rotate(-4deg) scale(1.18); filter: brightness(3); opacity: 0.5; }
+          100% { transform: rotate(0deg) scale(1.2); filter: brightness(5); opacity: 0; }
+        }
+        @keyframes slowReveal {
+          0% { transform: scale(0.5); opacity: 0; filter: blur(10px); }
+          100% { transform: scale(1); opacity: 1; filter: blur(0px); }
+        }
+      `}} />
+    </div>
+  );
+}
